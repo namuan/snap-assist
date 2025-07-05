@@ -1,0 +1,18 @@
+# ignore all root items
+/*
+
+# unignore folders
+!snap_assist/
+!docs/
+
+# unignore files
+!.gitignore
+!README.md
+!pyproject.toml
+!uv.lock
+!Makefile
+!.pre-commit-config.yaml
+!.editorconfig
+!CONTRIBUTING.md
+!LICENSE
+!tox.ini
