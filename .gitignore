@@ -1,5 +1,6 @@
 # ignore all root items
 /*
+__pycache__/
 
 # unignore folders
 !snap_assist/
