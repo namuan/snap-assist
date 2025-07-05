@@ -19,6 +19,8 @@ from PyQt6.QtWidgets import (
 # --- Ollama API Configuration ---
 OLLAMA_ENDPOINT = "http://localhost:11434/api/generate"
 OLLAMA_SELECTED_MODEL = "llama3.2:latest"
+TEXT_FONT = "Fantasque Sans Mono"
+TEXT_FONT_SIZE = 18
 
 
 class ApiWorker(QObject):
@@ -265,66 +267,66 @@ class AppWindow(QMainWindow):
 
     def apply_styles(self):
         """Applies QSS to style the application widgets."""
-        style_sheet = """
-            #centralWidget {
+        style_sheet = f"""
+            #centralWidget {{
                 background-color: #FFFFFF;
                 border: 2px solid #005fa3;
                 border-radius: 6px;
-            }
+            }}
 
-            QComboBox, QPushButton, QTextEdit {
-                font-family: "Fantasque Sans Mono";
-                font-size: 18px;
-            }
+            QComboBox, QPushButton, QTextEdit {{
+                font-family: {TEXT_FONT};
+                font-size: {TEXT_FONT_SIZE}px;
+            }}
 
-            QComboBox, QPushButton {
+            QComboBox, QPushButton {{
                 min-height: 28px;
                 border-radius: 4px;
-            }
+            }}
 
-            QComboBox {
+            QComboBox {{
                 background-color: #F9F9F9;
                 border: 1px solid #C6C6C6;
                 padding: 1px 10px 1px 10px;
-            }
+            }}
 
-            QComboBox::drop-down { border: none;}
+            QComboBox::drop-down {{ border: none;}}
 
-            QComboBox:hover {
+            QComboBox:hover {{
                 background-color: #0078d7;
                 color: black;
-            }
+            }}
 
-            QComboBox:selected {
+            QComboBox:selected {{
                 background-color: #005fa3;
                 color: white;
-            }
+            }}
 
-            QPushButton {
+            QPushButton {{
                 background-color: #F0F0F0;
                 border: 1px solid #C6C6C6;
                 padding: 0 14px;
-            }
+            }}
 
-            QPushButton:hover { background-color: #E6E6E6; }
+            QPushButton:hover {{ background-color: #E6E6E6; }}
 
-            QPushButton#closeButton {
+            QPushButton#closeButton {{
                 background-color: #005fa3;
                 color: white;
                 border: none;
                 font-weight: 500;
                 padding: 0 22px;
-            }
+            }}
 
-            QPushButton#closeButton:hover { background-color: #007BD6; }
+            QPushButton#closeButton:hover {{ background-color: #007BD6; }}
 
-            QTextEdit {
+            QTextEdit {{
                 border: 1px solid #C6C6C6;
                 border-radius: 2px;
                 padding: 4px;
                 background-color: #FFFFFF;
                 color: #333333;
-            }
+            }}
         """
         self.setStyleSheet(style_sheet)
 
