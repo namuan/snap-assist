@@ -27,9 +27,9 @@ class ApiWorker(QObject):
     to avoid blocking the main GUI thread.
     """
 
-    chunk_received = pyqtSignal(str)
-    finished = pyqtSignal()
-    error_occurred = pyqtSignal(str)
+    chunk_received: pyqtSignal = pyqtSignal(str)
+    finished: pyqtSignal = pyqtSignal()
+    error_occurred: pyqtSignal = pyqtSignal(str)
 
     def __init__(self, prompt):
         super().__init__()
@@ -116,13 +116,16 @@ class AppWindow(QMainWindow):
         self.dropdown = QComboBox()
         chat_modes = self.get_chat_modes()
         self.dropdown.addItems(chat_modes.keys())
+        # noinspection PyUnresolvedReferences
         self.dropdown.currentTextChanged.connect(self.on_mode_change)
 
         self.copy_text_button = QPushButton("Copy Text")
+        # noinspection PyUnresolvedReferences
         self.copy_text_button.clicked.connect(self.copy_and_close)
 
         self.close_button = QPushButton("Close")
         self.close_button.setObjectName("closeButton")
+        # noinspection PyUnresolvedReferences
         self.close_button.clicked.connect(self.close)
 
         top_bar_layout.addWidget(self.dropdown, 1)
@@ -205,10 +208,12 @@ class AppWindow(QMainWindow):
         self.api_worker.moveToThread(self.api_thread)
 
         # Set up connections for the new worker and thread lifecycle management.
+        # noinspection PyUnresolvedReferences
         self.api_thread.started.connect(self.api_worker.run)
         self.api_worker.finished.connect(self.api_thread.quit)
         # Ensure both worker and thread are deleted after they finish.
         self.api_worker.finished.connect(self.api_worker.deleteLater)
+        # noinspection PyUnresolvedReferences
         self.api_thread.finished.connect(self.api_thread.deleteLater)
 
         # Connect worker signals to UI slots
@@ -243,7 +248,8 @@ class AppWindow(QMainWindow):
             pyperclip.copy(text_to_copy)
         self.close()
 
-    def get_chat_modes(self):
+    @staticmethod
+    def get_chat_modes():
         """Returns a dictionary of chat modes."""
         return {
             "Proofread": "You are a grammar proofreading assistant. Output ONLY the corrected text without any additional comments. Maintain the original text structure and writing style. Respond in the same language as the input (e.g., English US, French):",
