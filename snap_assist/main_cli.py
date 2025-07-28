@@ -16,6 +16,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from snap_assist.chat_modes import get_chat_modes
+
 # --- Ollama API Configuration ---
 OLLAMA_ENDPOINT = "http://localhost:11434/api/generate"
 OLLAMA_SELECTED_MODEL = "llama3.2:latest"
@@ -116,7 +118,7 @@ class AppWindow(QMainWindow):
         top_bar_layout.setSpacing(8)
 
         self.dropdown = QComboBox()
-        chat_modes = self.get_chat_modes()
+        chat_modes = get_chat_modes()
         self.dropdown.addItems(chat_modes.keys())
         # noinspection PyUnresolvedReferences
         self.dropdown.currentTextChanged.connect(self.on_mode_change)
@@ -195,7 +197,7 @@ class AppWindow(QMainWindow):
 
         # Build the prompt for the new request
         mode_key = self.dropdown.currentText()
-        prompt_template = self.get_chat_modes().get(mode_key, "")
+        prompt_template = get_chat_modes().get(mode_key, "")
 
         additional_instructions = self.text_input.toPlainText().strip()
         prompt_body = self.main_clipboard_text
@@ -249,21 +251,6 @@ class AppWindow(QMainWindow):
         if text_to_copy:
             pyperclip.copy(text_to_copy)
         self.close()
-
-    @staticmethod
-    def get_chat_modes():
-        """Returns a dictionary of chat modes."""
-        return {
-            "Proofread": "You are a grammar proofreading assistant. Output ONLY the corrected text without any additional comments. Maintain the original text structure and writing style. Respond in the same language as the input (e.g., English US, French):",
-            "Summarise": "Provide summary in bullet points for the following text:",
-            "Explain": "Can you explain the following:",
-            "Rewrite": "You are a writing assistant. Rewrite the text provided by the user to improve phrasing. Output ONLY the rewritten text without additional comments. Respond in the same language as the input (e.g., English US, French):",
-            "Professional": "You are a writing assistant. Rewrite the text provided by the user to sound more professional. Output ONLY the professional text without additional comments. Respond in the same language as the input (e.g., English US, French):",
-            "Friendly": "You are a writing assistant. Rewrite the text provided by the user to be more friendly. Output ONLY the friendly text without additional comments. Respond in the same language as the input (e.g., English US, French):",
-            "Concise": "You are a writing assistant. Rewrite the text provided by the user to be slightly more concise in tone, thus making it just a bit shorter. Do not change the text too much or be too reductive. Output ONLY the concise version without additional comments. Respond in the same language as the input (e.g., English US, French):",
-            "Fallacy Finder": "I want you to act as a fallacy finder. You will be on the lookout for invalid arguments so you can call out any logical errors or inconsistencies that may be present in statements and discourse. Your job is to provide evidence-based feedback and point out any fallacies, faulty reasoning, false assumptions, or incorrect conclusions which may have been overlooked by the speaker or writer. Text:",
-            "Answer It": "You are an intelligent assistant. Help user with the query. Query:",
-        }
 
     def apply_styles(self):
         """Applies QSS to style the application widgets."""
