@@ -1,16 +1,21 @@
 import contextlib
 import json
+import random
 import sys
+import time
+from typing import Optional
 
 import pyperclip  # Dependency: pip install pyperclip
 import requests  # Dependency: pip install requests
 from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
-    QComboBox,
     QHBoxLayout,
+    QLabel,
     QMainWindow,
+    QProgressBar,
     QPushButton,
+    QScrollArea,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -18,11 +23,15 @@ from PyQt6.QtWidgets import (
 
 from snap_assist.chat_modes import get_chat_modes
 
+# Use a cryptographically secure RNG for backoff jitter to satisfy S311
+secure_random = random.SystemRandom()
+
 # --- Ollama API Configuration ---
 OLLAMA_ENDPOINT = "http://localhost:11434/api/generate"
 OLLAMA_SELECTED_MODEL = "llama3.2:latest"
 TEXT_FONT = "Fantasque Sans Mono"
 TEXT_FONT_SIZE = 18
+DEFAULT_MODE = "Rewrite"
 
 
 class ApiWorker(QObject):
@@ -32,14 +41,16 @@ class ApiWorker(QObject):
     """
 
     chunk_received: pyqtSignal = pyqtSignal(str)
+    chunk_received_with_mode: pyqtSignal = pyqtSignal(str, str)  # (mode_name, chunk)
     finished: pyqtSignal = pyqtSignal()
     error_occurred: pyqtSignal = pyqtSignal(str)
 
-    def __init__(self, prompt):
+    def __init__(self, mode_name: str, prompt: str):
         super().__init__()
+        self.mode_name = mode_name
         self.prompt = prompt
 
-    def run(self):
+    def run(self):  # noqa: C901
         """
         Makes the streaming API call to Ollama.
         Emits signals for each response chunk, on error, and on completion.
@@ -53,36 +64,210 @@ class ApiWorker(QObject):
         }
         headers = {"Content-Type": "application/json"}
 
-        try:
+        # Retry configuration
+        max_retries = 3
+        base_backoff = 1.5
+        max_backoff = 10.0
+
+        attempt = 0
+        while attempt <= max_retries:
             # Check if the thread has been told to stop before starting the request
             if QThread.currentThread().isInterruptionRequested():
                 self.finished.emit()
                 return
-
-            with requests.post(url, json=payload, headers=headers, stream=True, timeout=20) as response:
-                response.raise_for_status()
-                for line in response.iter_lines():
-                    # Check for interruption during the streaming loop
-                    if QThread.currentThread().isInterruptionRequested():
-                        break
-                    if line:
-                        decoded_line = line.decode("utf-8")
-                        data = json.loads(decoded_line)
-                        response_chunk = data.get("response", "")
-                        self.chunk_received.emit(response_chunk)
-                        if data.get("done", False):
-                            break
-        except requests.exceptions.RequestException as e:
-            # Avoid emitting an error if the thread was just interrupted.
-            if not QThread.currentThread().isInterruptionRequested():
-                error_message = f"API request failed: {e}"
-                self.error_occurred.emit(error_message)
-        finally:
-            # Use try-except to prevent crash if worker is deleted before signal emission
             try:
-                self.finished.emit()
-            except RuntimeError:
-                contextlib.suppress(RuntimeError)
+                with requests.post(url, json=payload, headers=headers, stream=True, timeout=20) as response:
+                    try:
+                        response.raise_for_status()
+                    except requests.exceptions.HTTPError:
+                        status = response.status_code
+                        # Retry on rate limit or server-side errors
+                        if status == 429 or 500 <= status < 600:
+                            # Honor Retry-After header if present and numeric
+                            retry_after_hdr = response.headers.get("Retry-After")
+                            if retry_after_hdr and retry_after_hdr.isdigit():
+                                sleep_secs = float(retry_after_hdr)
+                            else:
+                                sleep_secs = min(max_backoff, (base_backoff**attempt) + secure_random.uniform(0, 0.5))
+                            if attempt < max_retries and not QThread.currentThread().isInterruptionRequested():
+                                # Sleep with interruption checks
+                                slept = 0.0
+                                step = 0.1
+                                while slept < sleep_secs:
+                                    if QThread.currentThread().isInterruptionRequested():
+                                        self.finished.emit()
+                                        return
+                                    time.sleep(step)
+                                    slept += step
+                                attempt += 1
+                                continue
+                            else:
+                                raise
+                        else:
+                            raise
+
+                    # Successful response; stream content
+                    for line in response.iter_lines():
+                        if QThread.currentThread().isInterruptionRequested():
+                            break
+                        if line:
+                            decoded_line = line.decode("utf-8")
+                            data = json.loads(decoded_line)
+                            response_chunk = data.get("response", "")
+                            self.chunk_received.emit(response_chunk)
+                            self.chunk_received_with_mode.emit(self.mode_name, response_chunk)
+                            if data.get("done", False):
+                                break
+                    # Completed successfully; exit retry loop
+                    break
+
+            except requests.exceptions.HTTPError as e:
+                if not QThread.currentThread().isInterruptionRequested():
+                    self.error_occurred.emit(f"API request failed: {e}")
+                break
+            except (
+                requests.exceptions.ConnectTimeout,
+                requests.exceptions.ReadTimeout,
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ConnectionError,
+            ) as e:
+                # Retry on transient network errors
+                sleep_secs = min(max_backoff, (base_backoff**attempt) + secure_random.uniform(0, 0.5))
+                if attempt < max_retries and not QThread.currentThread().isInterruptionRequested():
+                    slept = 0.0
+                    step = 0.2
+                    while slept < sleep_secs:
+                        if QThread.currentThread().isInterruptionRequested():
+                            self.finished.emit()
+                            return
+                        time.sleep(step)
+                        slept += step
+                    attempt += 1
+                    continue
+                else:
+                    if not QThread.currentThread().isInterruptionRequested():
+                        self.error_occurred.emit(f"Network error: {e}")
+                    break
+            except requests.exceptions.RequestException as e:
+                # Non-retriable
+                if not QThread.currentThread().isInterruptionRequested():
+                    self.error_occurred.emit(f"API request failed: {e}")
+                break
+            finally:
+                # Note: finished signal emitted after loop to avoid double emission on retries
+                pass
+
+        # Use try-except to prevent crash if worker is deleted before signal emission
+        with contextlib.suppress(RuntimeError):
+            self.finished.emit()
+
+
+class ResultPanel(QWidget):
+    """Reusable widget for displaying individual mode output with header, copy, and progress state."""
+
+    refresh_requested: pyqtSignal = pyqtSignal(str)
+
+    def __init__(self, mode_name: str, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.mode_name = mode_name
+
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(6, 6, 6, 6)
+        self.layout.setSpacing(4)
+
+        # Header row: Mode label, spacer, Copy button
+        header = QHBoxLayout()
+        header.setSpacing(6)
+
+        self.title_label = QLabel(mode_name)
+        self.title_label.setObjectName("resultPanelTitle")
+
+        self.progress = QProgressBar()
+        self.progress.setObjectName("resultPanelProgress")
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(4)
+        self.progress.hide()
+
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.setObjectName("refreshPanelButton")
+        self.refresh_btn.setFixedWidth(80)
+        # noinspection PyUnresolvedReferences
+        self.refresh_btn.clicked.connect(lambda: self.refresh_requested.emit(self.mode_name))
+
+        self.copy_btn = QPushButton("Copy")
+        self.copy_btn.setObjectName("copyResultButton")
+        self.copy_btn.setFixedWidth(70)
+        # noinspection PyUnresolvedReferences
+        self.copy_btn.clicked.connect(self.copy_text)
+
+        header.addWidget(self.title_label)
+        header.addStretch(1)
+        header.addWidget(self.refresh_btn)
+        header.addWidget(self.copy_btn)
+
+        # Read-only output area
+        self.output = QTextEdit()
+        self.output.setReadOnly(True)
+        with contextlib.suppress(Exception):
+            self.output.setFontFamily(TEXT_FONT)
+            self.output.setFontPointSize(TEXT_FONT_SIZE)
+
+        self.layout.addLayout(header)
+        self.layout.addWidget(self.output)
+        self.layout.addWidget(self.progress)
+
+    # Public API
+    def set_loading(self, loading: bool):
+        if loading:
+            self.progress.show()
+            # Indeterminate/busy mode
+            self.progress.setRange(0, 0)
+            self.copy_btn.setEnabled(False)
+            if not self.output.toPlainText().strip() or self.output.toPlainText().strip() in (
+                "Queued...",
+                "Loading...",
+            ):
+                self.output.setPlainText("Loading...")
+            # Reset error style when starting to load
+            self.title_label.setStyleSheet("")
+        else:
+            self.progress.hide()
+            # Reset to determinate idle state
+            self.progress.setRange(0, 1)
+            self.progress.setValue(1)
+            self.copy_btn.setEnabled(True)
+
+    def set_queued(self):
+        """Show queued state without progress bar."""
+        self.progress.hide()
+        self.copy_btn.setEnabled(False)
+        self.title_label.setStyleSheet("")
+        self.output.setPlainText("Queued...")
+
+    def append_text(self, text: str):
+        # Clear placeholder 'Loading...' if present
+        if self.output.toPlainText().strip() == "Loading...":
+            self.output.clear()
+        self.output.insertPlainText(text)
+
+    def set_text(self, text: str):
+        self.output.setPlainText(text)
+
+    def set_error(self, error_message: str):
+        # Show error in panel and style title as error
+        self.set_loading(False)
+        self.output.setPlainText(error_message)
+        self.title_label.setStyleSheet("color: #e74c3c; font-weight: 600;")
+
+    def text(self) -> str:
+        return self.output.toPlainText()
+
+    def copy_text(self):
+        try:
+            pyperclip.copy(self.text())
+        except Exception:
+            # Fallback: select all and rely on user copy if clipboard fails
+            self.output.selectAll()
 
 
 class AppWindow(QMainWindow):
@@ -96,12 +281,27 @@ class AppWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Popup")
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
-        self.setGeometry(100, 100, 650, 550)
+        self.setGeometry(100, 100, 900, 700)
         self.center_window()
 
-        # References to the current running thread and worker
-        self.api_thread = None
-        self.api_worker = None
+        # References to the current running threads and workers per mode
+        self.api_thread = None  # legacy
+        self.api_worker = None  # legacy
+        self.api_threads: dict[str, QThread] = {}
+        self.api_workers: dict[str, ApiWorker] = {}
+        self.mode_panels: dict[str, ResultPanel] = {}
+        # Generation guard to avoid stale updates from previous runs
+        self.current_generation: int = 0
+        # Per-mode generation tokens for precise refresh control
+        self.mode_generations: dict[str, int] = {}
+        # Per-mode result tracking
+        self.mode_results: dict[str, str] = {}
+        self.mode_status: dict[str, str] = {}
+        self.mode_errors: dict[str, str] = {}
+        # Concurrency control
+        self.max_concurrent_requests: int = 3
+        self.pending_modes: list[str] = []
+        self.running_modes: set[str] = set()
         # Store the main text from the clipboard at launch
         self.main_clipboard_text = ""
 
@@ -110,18 +310,14 @@ class AppWindow(QMainWindow):
         self.setCentralWidget(self.central_widget)
 
         self.main_layout = QVBoxLayout(self.central_widget)
-        self.main_layout.setContentsMargins(12, 12, 12, 12)
-        self.main_layout.setSpacing(10)
+        self.main_layout.setContentsMargins(8, 8, 8, 8)
+        self.main_layout.setSpacing(6)
 
         # --- Top Bar ---
         top_bar_layout = QHBoxLayout()
-        top_bar_layout.setSpacing(8)
+        top_bar_layout.setSpacing(6)
 
-        self.dropdown = QComboBox()
-        chat_modes = get_chat_modes()
-        self.dropdown.addItems(chat_modes.keys())
-        # noinspection PyUnresolvedReferences
-        self.dropdown.currentTextChanged.connect(self.on_mode_change)
+        # Removed dropdown; multi-mode UI will be implemented with panels
 
         self.copy_text_button = QPushButton("Copy Text")
         # noinspection PyUnresolvedReferences
@@ -132,122 +328,304 @@ class AppWindow(QMainWindow):
         # noinspection PyUnresolvedReferences
         self.close_button.clicked.connect(self.close)
 
-        top_bar_layout.addWidget(self.dropdown, 1)
+        top_bar_layout.addStretch(1)
+
+        # Refresh All button to re-run all prompts simultaneously
+        self.refresh_button = QPushButton("Refresh All")
+        self.refresh_button.setObjectName("refreshAllButton")
+        # noinspection PyUnresolvedReferences
+        self.refresh_button.clicked.connect(self.run_all_generations)
+        top_bar_layout.addWidget(self.refresh_button)
+
         top_bar_layout.addWidget(self.copy_text_button)
         top_bar_layout.addWidget(self.close_button)
 
-        # --- Text Input Area ---
-        self.text_input = QTextEdit()
-        self.text_input.setPlaceholderText("Add additional instructions here (optional)...")
-        self.text_input.setFixedHeight(70)
-
         # --- Read-Only Text Area ---
-        self.read_only_text_area = QTextEdit()
-        self.read_only_text_area.setReadOnly(True)
+        # Replace single read-only area with scrollable container of ResultPanels
+        self.read_only_text_area = None
+        self.panels_container = QWidget()
+        self.panels_layout = QVBoxLayout(self.panels_container)
+        self.panels_layout.setContentsMargins(0, 0, 0, 0)
+        self.panels_layout.setSpacing(6)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setWidget(self.panels_container)
+
+        # Create panels for all chat modes
+        for mode_name in get_chat_modes():
+            panel = ResultPanel(mode_name)
+            self.mode_panels[mode_name] = panel
+            # noinspection PyUnresolvedReferences
+            panel.refresh_requested.connect(self.refresh_mode)
+            self.panels_layout.addWidget(panel)
+        self.panels_layout.addStretch(1)
 
         # --- Assemble Main Layout ---
         self.main_layout.addLayout(top_bar_layout)
-        self.main_layout.addWidget(self.text_input)
-        self.main_layout.addWidget(self.read_only_text_area, 1)
+        self.main_layout.addWidget(self.scroll_area, 1)
 
         self.apply_styles()
 
         self.process_clipboard_on_launch()
 
-    def center_window(self):
-        """Centers the application window on the screen."""
-        # Get the screen geometry
-        screen_geometry = QApplication.primaryScreen().geometry()
-        window_geometry = self.frameGeometry()
+    # Dropdown removed; generation is triggered on launch and via future Refresh All
 
-        # Calculate the center position
-        x = (screen_geometry.width() - window_geometry.width()) // 2
-        y = (screen_geometry.height() - window_geometry.height()) // 2
+    def update_copy_button_state(self):
+        """Enable Copy button only when no mode is running."""
+        any_running = any(status == "running" for status in self.mode_status.values())
+        self.copy_text_button.setEnabled(not any_running)
 
-        # Move the window to the calculated position
-        self.move(x, y)
+    # Build the prompt for a given mode using clipboard text and mode instructions
+    def build_prompt(self, mode_name: str) -> str:
+        modes = get_chat_modes()
+        instruction = modes.get(mode_name, "")
+        text = self.main_clipboard_text or ""
+        if instruction:
+            return f"{instruction}\n\n{text}"
+        return text
 
-    def on_mode_change(self):
-        """
-        Triggered when the dropdown selection changes.
-        Reruns the API call with the new mode using the original clipboard text
-        and any new manual instructions.
-        """
-        self.run_generation()
-
-    def run_generation(self):
-        """
-        Central function to handle the Ollama API call. It safely stops any
-        existing call and starts a new one based on the stored clipboard text
-        and current manual input.
-        """
-        if not self.main_clipboard_text.strip():
-            self.read_only_text_area.setText("Main text from clipboard is empty.")
-            return
-
-        # Safely stop any previous thread that might be running.
+    def stop_all_threads(self, wait: bool = False):
+        """Request interruption and quit for all running threads, optionally wait for completion."""
+        # Stop legacy single thread if used
         try:
             if self.api_thread and self.api_thread.isRunning():
                 self.api_thread.requestInterruption()
                 self.api_thread.quit()
+                if wait:
+                    self.api_thread.wait()
         except RuntimeError:
-            pass  # Object was already deleted, safe to ignore.
+            pass
+        # Stop all per-mode threads
+        try:
+            for thread in list(self.api_threads.values()):
+                if thread and thread.isRunning():
+                    thread.requestInterruption()
+                    thread.quit()
+                    if wait:
+                        thread.wait()
+        except RuntimeError:
+            pass
 
-        self.read_only_text_area.clear()
+    def run_all_generations(self):
+        """Start concurrent generation for all modes, each updating its own panel, with concurrency limit."""
+        if not self.main_clipboard_text.strip():
+            # Show message on first panel if available
+            if self.mode_panels:
+                first = next(iter(self.mode_panels.values()))
+                first.set_text("Main text from clipboard is empty.")
+            return
 
-        # Build the prompt for the new request
-        mode_key = self.dropdown.currentText()
-        prompt_template = get_chat_modes().get(mode_key, "")
+        # Bump generation to invalidate stale callbacks
+        self.current_generation += 1
+        gen = self.current_generation
 
-        additional_instructions = self.text_input.toPlainText().strip()
-        prompt_body = self.main_clipboard_text
-        if additional_instructions:
-            prompt_body += f"\n\nAdditional Instructions: {additional_instructions}"
+        # Stop previous threads if any
+        self.stop_all_threads(wait=False)
+        # Clear references; old threads may still finish, but their signals will be ignored via generation guard
+        self.api_threads.clear()
+        self.api_workers.clear()
 
-        full_prompt = f"{prompt_template}\n\n{prompt_body}"
+        # Reset per-mode tracking and UI
+        self.mode_results.clear()
+        self.mode_errors.clear()
+        self.mode_status = {m: "queued" for m in self.mode_panels}
+        self.update_copy_button_state()
 
-        # Create and configure a new thread and worker
-        self.api_thread = QThread()
-        self.api_worker = ApiWorker(full_prompt)
-        self.api_worker.moveToThread(self.api_thread)
+        # Clear outputs and set queued state initially
+        for panel in self.mode_panels.values():
+            panel.set_text("")
+            panel.set_loading(False)
+            panel.set_queued()
+            # Set per-mode generation token
+            self.mode_generations[panel.mode_name] = gen
 
-        # Set up connections for the new worker and thread lifecycle management.
-        # noinspection PyUnresolvedReferences
-        self.api_thread.started.connect(self.api_worker.run)
-        self.api_worker.finished.connect(self.api_thread.quit)
-        # Ensure both worker and thread are deleted after they finish.
-        self.api_worker.finished.connect(self.api_worker.deleteLater)
-        # noinspection PyUnresolvedReferences
-        self.api_thread.finished.connect(self.api_thread.deleteLater)
+        # Build queue and start up to the concurrency limit
+        self.pending_modes = list(self.mode_panels)
+        self.running_modes.clear()
 
-        # Connect worker signals to UI slots
-        self.api_worker.chunk_received.connect(self.update_output_text)
-        self.api_worker.error_occurred.connect(self.show_api_error)
+        initial = min(self.max_concurrent_requests, len(self.pending_modes))
+        for _ in range(initial):
+            self.start_next_in_queue()
 
-        self.api_thread.start()
+    def start_next_in_queue(self):
+        if not self.pending_modes:
+            return
+        mode_name = self.pending_modes.pop(0)
+        # Use the mode's own generation token to avoid cross-contamination
+        generation = self.mode_generations.get(mode_name, self.current_generation)
+        self.start_worker_for_mode(generation, mode_name)
+
+    def start_worker_for_mode(self, generation: int, mode_name: str):
+        # Mark running and update UI
+        self.mode_status[mode_name] = "running"
+        self.running_modes.add(mode_name)
+        panel = self.mode_panels.get(mode_name)
+        if panel:
+            panel.set_loading(True)
+
+        # Start worker per mode
+        thread = QThread()
+        worker = ApiWorker(mode_name, self.build_prompt(mode_name))
+        worker.moveToThread(thread)
+
+        # Start/finish lifecycle
+        thread.started.connect(worker.run)  # type: ignore[attr-defined]
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        # Connect signals to panel updates with generation guard
+        worker.chunk_received_with_mode.connect(lambda m, c, g=generation: self.update_panel_text_if_current(g, m, c))
+        # Bind mode for error and finished callbacks with generation guard
+        worker.error_occurred.connect(
+            lambda msg, m=mode_name, g=generation: self.show_panel_error_if_current(g, m, msg)
+        )
+        worker.finished.connect(lambda m=mode_name, g=generation: self.on_worker_finished_if_current(g, m))
+
+        self.api_threads[mode_name] = thread
+        self.api_workers[mode_name] = worker
+        thread.start()
+
+    def update_panel_text(self, mode_name: str, chunk: str):
+        panel = self.mode_panels.get(mode_name)
+        if panel:
+            panel.append_text(chunk)
+        # Track text per mode
+        self.mode_results[mode_name] = self.mode_results.get(mode_name, "") + chunk
+
+    def update_panel_text_if_current(self, generation: int, mode_name: str, chunk: str):
+        if generation != self.mode_generations.get(mode_name):
+            return
+        self.update_panel_text(mode_name, chunk)
+
+    def show_panel_error(self, mode_name: str, error_message: str):
+        panel = self.mode_panels.get(mode_name)
+        if panel:
+            panel.set_error(error_message)
+        # Track error and mark status
+        self.mode_errors[mode_name] = error_message
+        self.mode_status[mode_name] = "error"
+        self.update_copy_button_state()
+
+    def show_panel_error_if_current(self, generation: int, mode_name: str, error_message: str):
+        if generation != self.mode_generations.get(mode_name):
+            return
+        self.show_panel_error(mode_name, error_message)
+
+    def on_worker_finished(self, mode_name: str):
+        panel = self.mode_panels.get(mode_name)
+        if panel:
+            panel.set_loading(False)
+        # If not already errored, mark as done
+        if self.mode_status.get(mode_name) != "error":
+            self.mode_status[mode_name] = "done"
+        # Remove from running set
+        if mode_name in self.running_modes:
+            self.running_modes.remove(mode_name)
+        # Start next from queue if any
+        if self.pending_modes:
+            self.start_next_in_queue()
+        self.update_copy_button_state()
+
+    def on_worker_finished_if_current(self, generation: int, mode_name: str):
+        if generation == self.mode_generations.get(mode_name):
+            # Current generation: normal finish handling
+            self.on_worker_finished(mode_name)
+        else:
+            # Stale generation: perform cleanup to avoid deadlocks but don't touch panel text/status
+            if mode_name in self.running_modes:
+                self.running_modes.remove(mode_name)
+            if self.pending_modes:
+                self.start_next_in_queue()
+            self.update_copy_button_state()
+
+    def refresh_mode(self, mode_name: str):
+        """Refresh generation for a single mode without affecting others."""
+        if not self.main_clipboard_text.strip():
+            panel = self.mode_panels.get(mode_name)
+            if panel:
+                panel.set_text("Main text from clipboard is empty.")
+            return
+
+        # Assign new generation token for this mode
+        self.current_generation += 1
+        gen = self.current_generation
+        self.mode_generations[mode_name] = gen
+
+        # Stop existing thread for this mode if running
+        try:
+            thread = self.api_threads.get(mode_name)
+            if thread and thread.isRunning():
+                thread.requestInterruption()
+                thread.quit()
+        except RuntimeError:
+            pass
+
+        # Ensure not duplicated in pending queue
+        with contextlib.suppress(ValueError):
+            if mode_name in self.pending_modes:
+                self.pending_modes.remove(mode_name)
+
+        # Reset this panel's state
+        self.mode_results.pop(mode_name, None)
+        self.mode_errors.pop(mode_name, None)
+        self.mode_status[mode_name] = "queued"
+        panel = self.mode_panels.get(mode_name)
+        if panel:
+            panel.set_text("")
+            panel.set_loading(False)
+            panel.set_queued()
+
+        # Start immediately if under concurrency limit; otherwise enqueue
+        # If this mode is currently running, enqueue the refreshed job to start after it stops
+        if mode_name in self.running_modes:
+            self.pending_modes.insert(0, mode_name)
+        else:
+            if len(self.running_modes) < self.max_concurrent_requests:
+                self.start_worker_for_mode(gen, mode_name)
+            else:
+                self.pending_modes.insert(0, mode_name)
+
+        self.update_copy_button_state()
 
     def process_clipboard_on_launch(self):
         """Grabs clipboard text and starts the initial API call."""
         self.main_clipboard_text = pyperclip.paste()
-        self.text_input.clear()  # Ensure the manual input is empty
 
         if not self.main_clipboard_text:
-            self.read_only_text_area.setText("Clipboard is empty. Copy some text and restart the application.")
+            # Show message on first panel if available
+            if self.mode_panels:
+                first = next(iter(self.mode_panels.values()))
+                first.set_text("Clipboard is empty. Copy some text and restart the application.")
             return
 
-        self.run_generation()
+        self.run_all_generations()
 
     def update_output_text(self, chunk: str):
-        """Slot to append new text chunks to the read-only text area."""
-        self.read_only_text_area.insertPlainText(chunk)
+        """Backward-compat for single-panel mode; append to first panel if exists."""
+        # If panels exist, append to the first one; otherwise ignore until multi-mode wiring is complete
+        first_panel = self.panels_container.findChild(QWidget)
+        if isinstance(first_panel, ResultPanel):
+            first_panel.append_text(chunk)
 
     def show_api_error(self, error_message: str):
-        """Slot to display API errors in the read-only text area."""
-        self.read_only_text_area.setText(error_message)
+        """Display API errors in the first panel if present."""
+        first_panel = self.panels_container.findChild(QWidget)
+        if isinstance(first_panel, ResultPanel):
+            first_panel.set_error(error_message)
 
     def copy_and_close(self):
-        """Copies the text from the read-only text area and closes the app."""
-        text_to_copy = self.read_only_text_area.toPlainText()
+        """Copies concatenated text from all panels and closes the app."""
+        texts = []
+        for i in range(self.panels_layout.count()):
+            item = self.panels_layout.itemAt(i)
+            w = item.widget()
+            if isinstance(w, ResultPanel):
+                t = w.text().strip()
+                if t:
+                    texts.append(f"## {w.mode_name}\n{t}")
+        text_to_copy = "\n\n".join(texts)
         if text_to_copy:
             pyperclip.copy(text_to_copy)
         self.close()
@@ -261,33 +639,31 @@ class AppWindow(QMainWindow):
                 border-radius: 6px;
             }}
 
-            QComboBox, QPushButton, QTextEdit {{
+            QPushButton, QTextEdit {{
                 font-family: {TEXT_FONT};
-                font-size: {TEXT_FONT_SIZE}px;
+                font-size: {max(12, TEXT_FONT_SIZE - 2)}px;
             }}
 
-            QComboBox, QPushButton {{
+            QPushButton {{
                 min-height: 28px;
                 border-radius: 4px;
             }}
 
-            QComboBox {{
-                background-color: #F9F9F9;
-                border: 1px solid #C6C6C6;
-                padding: 1px 10px 1px 10px;
+            QPushButton#refreshAllButton {{
+                background-color: #F7FAFF;
+                border: 1px solid #B5D3F0;
+                padding: 0 14px;
+                color: #0B5CAD;
             }}
+            QPushButton#refreshAllButton:hover {{ background-color: #EAF3FF; }}
 
-            QComboBox::drop-down {{ border: none;}}
-
-            QComboBox:hover {{
-                background-color: #0078d7;
-                color: black;
+            QPushButton#refreshPanelButton {{
+                background-color: #F7FAFF;
+                border: 1px solid #B5D3F0;
+                padding: 0 10px;
+                color: #0B5CAD;
             }}
-
-            QComboBox:selected {{
-                background-color: #005fa3;
-                color: white;
-            }}
+            QPushButton#refreshPanelButton:hover {{ background-color: #EAF3FF; }}
 
             QPushButton {{
                 background-color: #F0F0F0;
@@ -308,26 +684,38 @@ class AppWindow(QMainWindow):
             QPushButton#closeButton:hover {{ background-color: #007BD6; }}
 
             QTextEdit {{
-                border: 1px solid #C6C6C6;
-                border-radius: 2px;
-                padding: 4px;
+                border: 1px solid #E0E0E0;
+                border-radius: 6px;
+                padding: 6px;
                 background-color: #FFFFFF;
                 color: #333333;
+            }}
+
+            QLabel#resultPanelTitle {{
+                font-weight: 600;
+            }}
+
+            QProgressBar#resultPanelProgress {{
+                border: none;
+                background: transparent;
             }}
         """
         self.setStyleSheet(style_sheet)
 
+    def center_window(self):
+        """Center the window on the primary screen."""
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        screen_geo = screen.availableGeometry()
+        frame_geo = self.frameGeometry()
+        frame_geo.moveCenter(screen_geo.center())
+        self.move(frame_geo.topLeft())
+
     def closeEvent(self, event):
         """Ensure any running thread is stopped cleanly on window close."""
-        try:
-            if self.api_thread and self.api_thread.isRunning():
-                self.api_thread.requestInterruption()
-                self.api_thread.quit()
-                # Using wait() is crucial here to ensure the thread finishes
-                # its cleanup before the main application exits.
-                self.api_thread.wait()
-        except RuntimeError:
-            pass  # Object was already deleted, safe to ignore.
+        with contextlib.suppress(RuntimeError):
+            self.stop_all_threads(wait=True)
         event.accept()
 
 
