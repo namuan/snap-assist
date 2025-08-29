@@ -170,6 +170,10 @@ class ResultPanel(QWidget):
     def __init__(self, mode_name: str, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.mode_name = mode_name
+        self.is_expanded = False
+        self.normal_height = 150  # Normal height
+        self.expanded_height = 400  # Expanded height
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)  # Make panel focusable
 
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(6, 6, 6, 6)
@@ -181,6 +185,11 @@ class ResultPanel(QWidget):
 
         self.title_label = QLabel(mode_name)
         self.title_label.setObjectName("resultPanelTitle")
+
+        # Hint label for expand/collapse
+        self.hint_label = QLabel("🖱️ Click to expand • ESC to collapse")
+        self.hint_label.setObjectName("hintLabel")
+        self.hint_label.setStyleSheet("color: #666666; font-size: 10px;")
 
         self.progress = QProgressBar()
         self.progress.setObjectName("resultPanelProgress")
@@ -201,6 +210,7 @@ class ResultPanel(QWidget):
         self.copy_btn.clicked.connect(self.copy_text)
 
         header.addWidget(self.title_label)
+        header.addWidget(self.hint_label)
         header.addStretch(1)
         header.addWidget(self.refresh_btn)
         header.addWidget(self.copy_btn)
@@ -208,6 +218,7 @@ class ResultPanel(QWidget):
         # Read-only output area
         self.output = QTextEdit()
         self.output.setReadOnly(True)
+        self.output.setFixedHeight(self.normal_height)
         with contextlib.suppress(Exception):
             self.output.setFontFamily(TEXT_FONT)
             self.output.setFontPointSize(TEXT_FONT_SIZE)
@@ -215,6 +226,27 @@ class ResultPanel(QWidget):
         self.layout.addLayout(header)
         self.layout.addWidget(self.output)
         self.layout.addWidget(self.progress)
+
+    def mousePressEvent(self, event):
+        """Expand the output area when clicked."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.toggle_expand()
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event):
+        """Collapse the output area when ESC is pressed."""
+        if event.key() == Qt.Key.Key_Escape and self.is_expanded:
+            self.toggle_expand()
+        else:
+            super().keyPressEvent(event)
+
+    def toggle_expand(self):
+        """Toggle between expanded and normal states."""
+        self.is_expanded = not self.is_expanded
+        if self.is_expanded:
+            self.output.setFixedHeight(self.expanded_height)
+        else:
+            self.output.setFixedHeight(self.normal_height)
 
     # Public API
     def set_loading(self, loading: bool):
@@ -695,6 +727,11 @@ class AppWindow(QMainWindow):
                 font-weight: 600;
             }}
 
+            QLabel#hintLabel {{
+                color: #888888;
+                font-size: 10px;
+            }}
+
             QProgressBar#resultPanelProgress {{
                 border: none;
                 background: transparent;
@@ -711,6 +748,16 @@ class AppWindow(QMainWindow):
         frame_geo = self.frameGeometry()
         frame_geo.moveCenter(screen_geo.center())
         self.move(frame_geo.topLeft())
+
+    def keyPressEvent(self, event):
+        """Handle ESC key press to collapse expanded panels."""
+        if event.key() == Qt.Key.Key_Escape:
+            # Collapse any expanded panels
+            for panel in self.mode_panels.values():
+                if panel.is_expanded:
+                    panel.toggle_expand()
+        else:
+            super().keyPressEvent(event)
 
     def closeEvent(self, event):
         """Ensure any running thread is stopped cleanly on window close."""
