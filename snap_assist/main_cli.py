@@ -166,6 +166,7 @@ class ResultPanel(QWidget):
     """Reusable widget for displaying individual mode output with header, copy, and progress state."""
 
     refresh_requested: pyqtSignal = pyqtSignal(str)
+    add_to_combine_requested: pyqtSignal = pyqtSignal(str)
 
     def __init__(self, mode_name: str, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -209,11 +210,18 @@ class ResultPanel(QWidget):
         # noinspection PyUnresolvedReferences
         self.copy_btn.clicked.connect(self.copy_text)
 
+        self.add_combine_btn = QPushButton("Add >>")
+        self.add_combine_btn.setObjectName("addCombineButton")
+        self.add_combine_btn.setFixedWidth(85)
+        # noinspection PyUnresolvedReferences
+        self.add_combine_btn.clicked.connect(lambda: self.add_to_combine_requested.emit(self.mode_name))
+
         header.addWidget(self.title_label)
         header.addWidget(self.hint_label)
         header.addStretch(1)
         header.addWidget(self.refresh_btn)
         header.addWidget(self.copy_btn)
+        header.addWidget(self.add_combine_btn)
 
         # Read-only output area
         self.output = QTextEdit()
@@ -255,6 +263,7 @@ class ResultPanel(QWidget):
             # Indeterminate/busy mode
             self.progress.setRange(0, 0)
             self.copy_btn.setEnabled(False)
+            self.add_combine_btn.setEnabled(False)
             if not self.output.toPlainText().strip() or self.output.toPlainText().strip() in (
                 "Queued...",
                 "Loading...",
@@ -268,11 +277,13 @@ class ResultPanel(QWidget):
             self.progress.setRange(0, 1)
             self.progress.setValue(1)
             self.copy_btn.setEnabled(True)
+            self.update_add_button_state()
 
     def set_queued(self):
         """Show queued state without progress bar."""
         self.progress.hide()
         self.copy_btn.setEnabled(False)
+        self.add_combine_btn.setEnabled(False)
         self.title_label.setStyleSheet("")
         self.output.setPlainText("Queued...")
 
@@ -301,6 +312,186 @@ class ResultPanel(QWidget):
             # Fallback: select all and rely on user copy if clipboard fails
             self.output.selectAll()
 
+    def update_add_button_state(self):
+        """Update the Add >> button state based on whether there's actual content."""
+        text = self.text().strip()
+        has_content = bool(text and text not in ("Queued...", "Loading..."))
+        self.add_combine_btn.setEnabled(has_content)
+
+
+class CombineControlPanel(QWidget):
+    """Right-side panel for combining and refining LLM responses."""
+
+    refine_requested: pyqtSignal = pyqtSignal(str)  # Emits combined text
+
+    def __init__(self, mode_panels: dict[str, "ResultPanel"], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.mode_panels = mode_panels
+        self.selected_responses: dict[str, str] = {}  # mode_name -> response_text
+        self.setFixedWidth(350)
+
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(8, 8, 8, 8)
+        self.layout.setSpacing(6)
+
+        # Title
+        title = QLabel("Combine & Refine")
+        title.setObjectName("combineTitle")
+        title.setStyleSheet("font-weight: 600; font-size: 14px;")
+        self.layout.addWidget(title)
+
+        # Instructions
+        instructions = QLabel("Click 'Add' buttons on panels to include responses for refinement.")
+        instructions.setWordWrap(True)
+        instructions.setStyleSheet("font-size: 11px; color: #666; padding: 4px;")
+        self.layout.addWidget(instructions)
+
+        # Selected responses list
+        selected_label = QLabel("Selected Responses:")
+        selected_label.setStyleSheet("font-size: 12px; color: #666;")
+        self.layout.addWidget(selected_label)
+
+        self.selected_scroll = QScrollArea()
+        self.selected_scroll.setWidgetResizable(True)
+        self.selected_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.selected_scroll.setMaximumHeight(120)
+
+        selected_widget = QWidget()
+        self.selected_layout = QVBoxLayout(selected_widget)
+        self.selected_layout.setContentsMargins(0, 0, 0, 0)
+        self.selected_layout.setSpacing(2)
+
+        self.selected_layout.addStretch(1)
+        self.selected_scroll.setWidget(selected_widget)
+        self.layout.addWidget(self.selected_scroll)
+
+        # Control buttons
+        buttons_layout = QHBoxLayout()
+        buttons_layout.setSpacing(6)
+
+        self.clear_button = QPushButton("Clear All")
+        self.clear_button.setObjectName("clearButton")
+        # noinspection PyUnresolvedReferences
+        self.clear_button.clicked.connect(self.clear_all)
+        buttons_layout.addWidget(self.clear_button)
+
+        self.refine_button = QPushButton("Refine")
+        self.refine_button.setObjectName("refineButton")
+        # noinspection PyUnresolvedReferences
+        self.refine_button.clicked.connect(self.request_refine)
+        buttons_layout.addWidget(self.refine_button)
+
+        self.layout.addLayout(buttons_layout)
+
+        # Refined result area
+        result_label = QLabel("Refined Result:")
+        result_label.setStyleSheet("font-size: 12px; color: #666;")
+        self.layout.addWidget(result_label)
+
+        self.result_text = QTextEdit()
+        self.result_text.setReadOnly(True)
+        with contextlib.suppress(Exception):
+            self.result_text.setFontFamily(TEXT_FONT)
+            self.result_text.setFontPointSize(TEXT_FONT_SIZE)
+        self.layout.addWidget(self.result_text)
+
+        self.copy_result_button = QPushButton("Copy")
+        self.copy_result_button.setObjectName("copyResultButton")
+        # noinspection PyUnresolvedReferences
+        self.copy_result_button.clicked.connect(self.copy_result)
+        self.layout.addWidget(self.copy_result_button)
+
+        self.update_selected_list()
+
+    def add_response(self, mode_name: str):
+        """Add a response to the selection."""
+        panel = self.mode_panels.get(mode_name)
+        if panel:
+            text = panel.text().strip()
+            if text and text not in ("Queued...", "Loading..."):
+                self.selected_responses[mode_name] = text
+                self.update_selected_list()
+
+    def remove_response(self, mode_name: str):
+        """Remove a response from the selection."""
+        if mode_name in self.selected_responses:
+            del self.selected_responses[mode_name]
+            self.update_selected_list()
+
+    def update_selected_list(self):
+        """Update the visual list of selected responses."""
+        # Clear all existing items including stretch
+        while self.selected_layout.count() > 0:
+            item = self.selected_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        # Add selected items
+        for mode_name in self.selected_responses:
+            item_layout = QHBoxLayout()
+            item_layout.setSpacing(4)
+
+            label = QLabel(f"{mode_name}")
+            label.setStyleSheet("font-size: 11px; color: #333;")
+            item_layout.addWidget(label)
+
+            remove_btn = QPushButton("X")
+            remove_btn.setFixedSize(20, 20)
+            remove_btn.setStyleSheet("font-size: 12px; color: #e74c3c; border: none; background: transparent;")
+            # noinspection PyUnresolvedReferences
+            remove_btn.clicked.connect(lambda checked=False, m=mode_name: self.remove_response(m))
+            item_layout.addWidget(remove_btn)
+
+            self.selected_layout.addLayout(item_layout)
+
+        # Add stretch at the end
+        self.selected_layout.addStretch(1)
+
+        # Update refine button state
+        self.refine_button.setEnabled(bool(self.selected_responses))
+
+    def clear_all(self):
+        """Clear all selected responses."""
+        self.selected_responses.clear()
+        self.update_selected_list()
+        self.clear_result()
+        # Force comprehensive UI refresh
+        self.selected_scroll.update()
+        self.selected_scroll.viewport().update()
+        self.update()
+        QApplication.processEvents()  # Process pending UI events
+
+    def request_refine(self):
+        """Emit signal with combined text for refinement."""
+        if not self.selected_responses:
+            return
+
+        # Build combined text
+        selected_texts = []
+        for mode_name, text in self.selected_responses.items():
+            selected_texts.append(f"## {mode_name}\n{text}")
+
+        combined_text = "\n\n".join(selected_texts)
+        self.refine_requested.emit(combined_text)
+
+    def set_refined_result(self, result: str):
+        """Display the refined result."""
+        self.result_text.setPlainText(result)
+
+    def copy_result(self):
+        """Copy the refined result to clipboard."""
+        result_text = self.result_text.toPlainText().strip()
+        if result_text and not result_text.startswith("Error:"):
+            try:
+                pyperclip.copy(result_text)
+            except Exception:
+                # Fallback: select all and rely on user copy if clipboard fails
+                self.result_text.selectAll()
+
+    def clear_result(self):
+        """Clear the refined result area."""
+        self.result_text.clear()
+
 
 class AppWindow(QMainWindow):
     """
@@ -313,7 +504,7 @@ class AppWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Popup")
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
-        self.setGeometry(100, 100, 900, 700)
+        self.setGeometry(100, 100, 1250, 700)
         self.center_window()
 
         # References to the current running threads and workers per mode
@@ -345,15 +536,21 @@ class AppWindow(QMainWindow):
         self.main_layout.setContentsMargins(8, 8, 8, 8)
         self.main_layout.setSpacing(6)
 
+        # Create main horizontal layout
+        main_h_layout = QHBoxLayout()
+        main_h_layout.setSpacing(6)
+
+        # --- Left Side: Main Content ---
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
+
         # --- Top Bar ---
         top_bar_layout = QHBoxLayout()
         top_bar_layout.setSpacing(6)
 
         # Removed dropdown; multi-mode UI will be implemented with panels
-
-        self.copy_text_button = QPushButton("Copy Text")
-        # noinspection PyUnresolvedReferences
-        self.copy_text_button.clicked.connect(self.copy_and_close)
 
         self.close_button = QPushButton("Close")
         self.close_button.setObjectName("closeButton")
@@ -369,7 +566,6 @@ class AppWindow(QMainWindow):
         self.refresh_button.clicked.connect(self.run_all_generations)
         top_bar_layout.addWidget(self.refresh_button)
 
-        top_bar_layout.addWidget(self.copy_text_button)
         top_bar_layout.addWidget(self.close_button)
 
         # --- Read-Only Text Area ---
@@ -393,9 +589,25 @@ class AppWindow(QMainWindow):
             self.panels_layout.addWidget(panel)
         self.panels_layout.addStretch(1)
 
+        # Assemble left layout
+        left_layout.addLayout(top_bar_layout)
+        left_layout.addWidget(self.scroll_area, 1)
+
+        # --- Right Side: Combine Control Panel ---
+        self.combine_panel = CombineControlPanel(self.mode_panels)
+        self.combine_panel.refine_requested.connect(self.run_refine_generation)
+
+        # Connect panel signals to combine panel after it's created
+        for panel in self.mode_panels.values():
+            # noinspection PyUnresolvedReferences
+            panel.add_to_combine_requested.connect(self.combine_panel.add_response)
+
+        # Assemble main horizontal layout
+        main_h_layout.addWidget(left_widget, 1)
+        main_h_layout.addWidget(self.combine_panel, 0)
+
         # --- Assemble Main Layout ---
-        self.main_layout.addLayout(top_bar_layout)
-        self.main_layout.addWidget(self.scroll_area, 1)
+        self.main_layout.addLayout(main_h_layout, 1)
 
         self.apply_styles()
 
@@ -462,7 +674,6 @@ class AppWindow(QMainWindow):
         self.mode_results.clear()
         self.mode_errors.clear()
         self.mode_status = {m: "queued" for m in self.mode_panels}
-        self.update_copy_button_state()
 
         # Clear outputs and set queued state initially
         for panel in self.mode_panels.values():
@@ -538,7 +749,6 @@ class AppWindow(QMainWindow):
         # Track error and mark status
         self.mode_errors[mode_name] = error_message
         self.mode_status[mode_name] = "error"
-        self.update_copy_button_state()
 
     def show_panel_error_if_current(self, generation: int, mode_name: str, error_message: str):
         if generation != self.mode_generations.get(mode_name):
@@ -558,7 +768,6 @@ class AppWindow(QMainWindow):
         # Start next from queue if any
         if self.pending_modes:
             self.start_next_in_queue()
-        self.update_copy_button_state()
 
     def on_worker_finished_if_current(self, generation: int, mode_name: str):
         if generation == self.mode_generations.get(mode_name):
@@ -570,7 +779,6 @@ class AppWindow(QMainWindow):
                 self.running_modes.remove(mode_name)
             if self.pending_modes:
                 self.start_next_in_queue()
-            self.update_copy_button_state()
 
     def refresh_mode(self, mode_name: str):
         """Refresh generation for a single mode without affecting others."""
@@ -619,7 +827,38 @@ class AppWindow(QMainWindow):
             else:
                 self.pending_modes.insert(0, mode_name)
 
-        self.update_copy_button_state()
+    def run_refine_generation(self, combined_text: str):
+        """Run refinement on combined text using direct API call."""
+        if not combined_text.strip():
+            return
+
+        # Clear previous result
+        self.combine_panel.clear_result()
+
+        # Build refinement prompt
+        refine_prompt = f"Review all the following alternative sentences and create a single, concise response that combines the strongest elements from each alternative. Preserve the exact tone and intent of the original sentences. Your output should contain ONLY the final consolidated response, with no additional commentary, explanations, or meta-text. Respond in the same language as the input:\n\n{combined_text}"
+
+        # Bump generation
+        self.current_generation += 1
+
+        # Create worker for refinement
+        thread = QThread()
+        worker = ApiWorker("Refine", refine_prompt)
+        worker.moveToThread(thread)
+
+        # Connect signals
+        thread.started.connect(worker.run)  # type: ignore[attr-defined]
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        # Handle chunks for refinement result
+        worker.chunk_received.connect(lambda c: self.combine_panel.result_text.insertPlainText(c))
+        worker.error_occurred.connect(lambda msg: self.combine_panel.result_text.setPlainText(f"Error: {msg}"))
+
+        self.api_threads["Refine"] = thread
+        self.api_workers["Refine"] = worker
+        thread.start()
 
     def process_clipboard_on_launch(self):
         """Grabs clipboard text and starts the initial API call."""
@@ -648,7 +887,7 @@ class AppWindow(QMainWindow):
             first_panel.set_error(error_message)
 
     def copy_and_close(self):
-        """Copies concatenated text from all panels and closes the app."""
+        """Copies concatenated text from all panels and refined result, then closes the app."""
         texts = []
         for i in range(self.panels_layout.count()):
             item = self.panels_layout.itemAt(i)
@@ -657,6 +896,12 @@ class AppWindow(QMainWindow):
                 t = w.text().strip()
                 if t:
                     texts.append(f"## {w.mode_name}\n{t}")
+
+        # Include refined result if available
+        refined_text = self.combine_panel.result_text.toPlainText().strip()
+        if refined_text and not refined_text.startswith("Error:"):
+            texts.append(f"## Refined Result\n{refined_text}")
+
         text_to_copy = "\n\n".join(texts)
         if text_to_copy:
             pyperclip.copy(text_to_copy)
