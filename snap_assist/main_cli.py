@@ -312,6 +312,9 @@ class ResultPanel(QWidget):
             # Fallback: select all and rely on user copy if clipboard fails
             self.output.selectAll()
 
+        # Close the application after copying
+        QApplication.quit()
+
     def update_add_button_state(self):
         """Update the Add >> button state based on whether there's actual content."""
         text = self.text().strip()
@@ -487,6 +490,9 @@ class CombineControlPanel(QWidget):
             except Exception:
                 # Fallback: select all and rely on user copy if clipboard fails
                 self.result_text.selectAll()
+
+        # Close the application after copying
+        QApplication.quit()
 
     def clear_result(self):
         """Clear the refined result area."""
