@@ -28,8 +28,8 @@ Homepage = "https://namuan.github.io/snap-assist/"
 Repository = "https://github.com/namuan/snap-assist"
 Documentation = "https://namuan.github.io/snap-assist/"
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=7.2.0",
     "pre-commit>=2.20.0",
     "tox-uv>=1.11.3",
