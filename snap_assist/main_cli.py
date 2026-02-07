@@ -26,9 +26,9 @@ from snap_assist.chat_modes import get_chat_modes
 # Use a cryptographically secure RNG for backoff jitter to satisfy S311
 secure_random = random.SystemRandom()
 
-# --- Ollama API Configuration ---
-OLLAMA_ENDPOINT = "http://localhost:11434/api/generate"
-OLLAMA_SELECTED_MODEL = "llama3.2:latest"
+# --- Osaurus API Configuration ---
+API_ENDPOINT = "http://127.0.0.1:1337/api/chat"
+SELECTED_MODEL = "default"
 TEXT_FONT = "Fantasque Sans Mono"
 TEXT_FONT_SIZE = 18
 DEFAULT_MODE = "Rewrite"
@@ -36,7 +36,7 @@ DEFAULT_MODE = "Rewrite"
 
 class ApiWorker(QObject):
     """
-    A worker object that runs the Ollama API call in a separate thread
+    A worker object that runs the Osaurus API call in a separate thread
     to avoid blocking the main GUI thread.
     """
 
@@ -52,14 +52,14 @@ class ApiWorker(QObject):
 
     def run(self):  # noqa: C901
         """
-        Makes the streaming API call to Ollama.
+        Makes the streaming API call to Osaurus.
         Emits signals for each response chunk, on error, and on completion.
         It is designed to be interruptible.
         """
-        url = OLLAMA_ENDPOINT
+        url = API_ENDPOINT
         payload = {
-            "model": OLLAMA_SELECTED_MODEL,
-            "prompt": self.prompt,
+            "model": SELECTED_MODEL,
+            "messages": [{"role": "user", "content": self.prompt}],
             "stream": True,
         }
         headers = {"Content-Type": "application/json"}
@@ -113,7 +113,8 @@ class ApiWorker(QObject):
                         if line:
                             decoded_line = line.decode("utf-8")
                             data = json.loads(decoded_line)
-                            response_chunk = data.get("response", "")
+                            # Osaurus returns content in message.content field
+                            response_chunk = data.get("message", {}).get("content", "")
                             self.chunk_received.emit(response_chunk)
                             self.chunk_received_with_mode.emit(self.mode_name, response_chunk)
                             if data.get("done", False):
@@ -501,7 +502,7 @@ class CombineControlPanel(QWidget):
 
 class AppWindow(QMainWindow):
     """
-    A desktop application that processes clipboard text using Ollama.
+    A desktop application that processes clipboard text using Osaurus.
     The user can add additional manual instructions. The "Copy Text" button
     copies the result and closes the app. The window is centered on screen.
     """
