@@ -7,9 +7,10 @@ from typing import Optional
 
 import pyperclip  # Dependency: pip install pyperclip
 import requests  # Dependency: pip install requests
-from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QObject, QSettings, Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -26,9 +27,9 @@ from snap_assist.chat_modes import get_chat_modes
 # Use a cryptographically secure RNG for backoff jitter to satisfy S311
 secure_random = random.SystemRandom()
 
-# --- Osaurus API Configuration ---
-API_ENDPOINT = "http://127.0.0.1:1337/api/chat"
-SELECTED_MODEL = "default"
+# --- LlamaBarn API Configuration ---
+API_ENDPOINT = "http://localhost:2276/v1/chat/completions"
+SELECTED_MODEL = "qwen3-4b"
 TEXT_FONT = "Fantasque Sans Mono"
 TEXT_FONT_SIZE = 18
 DEFAULT_MODE = "Rewrite"
@@ -36,7 +37,7 @@ DEFAULT_MODE = "Rewrite"
 
 class ApiWorker(QObject):
     """
-    A worker object that runs the Osaurus API call in a separate thread
+    A worker object that runs the LlamaBarn API call in a separate thread
     to avoid blocking the main GUI thread.
     """
 
@@ -52,7 +53,7 @@ class ApiWorker(QObject):
 
     def run(self):  # noqa: C901
         """
-        Makes the streaming API call to Osaurus.
+        Makes the streaming API call to LlamaBarn (OpenAI-compatible).
         Emits signals for each response chunk, on error, and on completion.
         It is designed to be interruptible.
         """
@@ -112,13 +113,17 @@ class ApiWorker(QObject):
                             break
                         if line:
                             decoded_line = line.decode("utf-8")
-                            data = json.loads(decoded_line)
-                            # Osaurus returns content in message.content field
-                            response_chunk = data.get("message", {}).get("content", "")
-                            self.chunk_received.emit(response_chunk)
-                            self.chunk_received_with_mode.emit(self.mode_name, response_chunk)
-                            if data.get("done", False):
+                            # OpenAI SSE format: lines are prefixed with "data: "
+                            if decoded_line.startswith("data: "):
+                                decoded_line = decoded_line[6:]
+                            if decoded_line == "[DONE]":
                                 break
+                            data = json.loads(decoded_line)
+                            # OpenAI-compatible: content in choices[0].delta.content
+                            response_chunk = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                            if response_chunk:
+                                self.chunk_received.emit(response_chunk)
+                                self.chunk_received_with_mode.emit(self.mode_name, response_chunk)
                     # Completed successfully; exit retry loop
                     break
 
@@ -161,6 +166,22 @@ class ApiWorker(QObject):
         # Use try-except to prevent crash if worker is deleted before signal emission
         with contextlib.suppress(RuntimeError):
             self.finished.emit()
+
+
+class ModelFetchWorker(QObject):
+    models_fetched = pyqtSignal(list)  # emits list[str] of model IDs
+    fetch_failed = pyqtSignal(str)  # emits error message
+
+    def run(self):
+        try:
+            base = API_ENDPOINT.rsplit("/chat/completions", 1)[0]
+            response = requests.get(f"{base}/models", timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            model_ids = [m["id"] for m in data.get("data", [])]
+            self.models_fetched.emit(model_ids)
+        except Exception as e:
+            self.fetch_failed.emit(str(e))
 
 
 class ResultPanel(QWidget):
@@ -566,6 +587,24 @@ class AppWindow(QMainWindow):
 
         top_bar_layout.addStretch(1)
 
+        self.model_label = QLabel("Model:")
+        self.model_combo = QComboBox()
+        self.model_combo.setObjectName("modelCombo")
+        self.model_combo.addItem("Loading...")
+        self.model_combo.setEnabled(False)
+        self.model_combo.setMinimumWidth(160)
+        self.model_combo.currentTextChanged.connect(self._on_model_selected)
+
+        self.model_refresh_btn = QPushButton("↻")
+        self.model_refresh_btn.setObjectName("modelRefreshButton")
+        self.model_refresh_btn.setToolTip("Refresh model list")
+        self.model_refresh_btn.setFixedWidth(28)
+        self.model_refresh_btn.clicked.connect(self._fetch_models)
+
+        top_bar_layout.addWidget(self.model_label)
+        top_bar_layout.addWidget(self.model_combo)
+        top_bar_layout.addWidget(self.model_refresh_btn)
+
         # Refresh All button to re-run all prompts simultaneously
         self.refresh_button = QPushButton("Refresh All")
         self.refresh_button.setObjectName("refreshAllButton")
@@ -618,9 +657,60 @@ class AppWindow(QMainWindow):
 
         self.apply_styles()
 
+        global SELECTED_MODEL
+        SELECTED_MODEL = self._load_model_setting()
+        self._fetch_models()
         self.process_clipboard_on_launch()
 
     # Dropdown removed; generation is triggered on launch and via future Refresh All
+
+    def _fetch_models(self):
+        self.model_combo.clear()
+        self.model_combo.addItem("Loading...")
+        self.model_combo.setEnabled(False)
+        self.model_refresh_btn.setEnabled(False)
+
+        self._model_thread = QThread(self)
+        self._model_worker = ModelFetchWorker()
+        self._model_worker.moveToThread(self._model_thread)
+        self._model_thread.started.connect(self._model_worker.run)
+        self._model_worker.models_fetched.connect(self._on_models_fetched)
+        self._model_worker.fetch_failed.connect(self._on_models_fetch_failed)
+        self._model_worker.models_fetched.connect(self._model_thread.quit)
+        self._model_worker.fetch_failed.connect(self._model_thread.quit)
+        self._model_worker.models_fetched.connect(self._model_worker.deleteLater)
+        self._model_worker.fetch_failed.connect(self._model_worker.deleteLater)
+        self._model_thread.finished.connect(self._model_thread.deleteLater)
+        self._model_thread.start()
+
+    def _on_models_fetched(self, model_ids: list):
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        for mid in model_ids:
+            self.model_combo.addItem(mid)
+        idx = self.model_combo.findText(SELECTED_MODEL)
+        self.model_combo.setCurrentIndex(max(0, idx))
+        self.model_combo.blockSignals(False)
+        self.model_combo.setEnabled(True)
+        self.model_refresh_btn.setEnabled(True)
+
+    def _on_models_fetch_failed(self, error: str):
+        self.model_combo.clear()
+        self.model_combo.addItem("Failed to load")
+        self.model_combo.setEnabled(False)
+        self.model_refresh_btn.setEnabled(True)
+
+    def _load_model_setting(self) -> str:
+        return QSettings("snap-assist", "snap-assist").value("selected_model", SELECTED_MODEL)
+
+    def _save_model_setting(self, model_id: str):
+        QSettings("snap-assist", "snap-assist").setValue("selected_model", model_id)
+
+    def _on_model_selected(self, model_id: str):
+        global SELECTED_MODEL
+        if model_id and model_id not in ("Loading...", "Failed to load"):
+            SELECTED_MODEL = model_id
+            self._save_model_setting(model_id)
 
     def update_copy_button_state(self):
         """Enable Copy button only when no mode is running."""
@@ -988,6 +1078,26 @@ class AppWindow(QMainWindow):
                 border: none;
                 background: transparent;
             }}
+
+            QComboBox#modelCombo {{
+                border: 1px solid #B5D3F0;
+                border-radius: 4px;
+                padding: 0 8px;
+                min-height: 28px;
+                background-color: #F7FAFF;
+                color: #0B5CAD;
+            }}
+            QComboBox#modelCombo:disabled {{ color: #999999; }}
+            QComboBox#modelCombo::drop-down {{ border: none; }}
+
+            QPushButton#modelRefreshButton {{
+                background-color: #F7FAFF;
+                border: 1px solid #B5D3F0;
+                color: #0B5CAD;
+                font-size: 14px;
+                padding: 0;
+            }}
+            QPushButton#modelRefreshButton:hover {{ background-color: #EAF3FF; }}
         """
         self.setStyleSheet(style_sheet)
 
